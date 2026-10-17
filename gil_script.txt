@@ -1,0 +1,46 @@
+# title: The GIL, explained!
+# subtitle: + free-threaded Python
+
+== PART 1 · WHAT IS THE GIL?
+Hi! Let's talk about Python's GIL — the Global Interpreter Lock.
+
+In regular CPython, the GIL is one big lock.
+Only the thread holding it can run Python bytecode.
+
+So even with 8 threads on 8 cores, only ONE runs Python code at a time. The rest wait their turn.
+
+Why? CPython manages memory with reference counts.
+The GIL keeps those counts safe without locking every single object.
+
+It also made C extensions easy to write, and kept single-threaded code fast.
+
+Threads still help with I/O! Waiting on the network or disk releases the GIL, so other threads get to run.
+
+But CPU-heavy pure Python? Threads won't speed it up.
+Usual workarounds: multiprocessing, or C libraries like NumPy that release the GIL.
+
+== PART 2 · PYTHON WITHOUT THE GIL
+Now the new part! PEP 703 proposed making the GIL optional.
+
+Python 3.13 (2024) shipped an experimental "free-threaded" build.
+Its executable is python3.13t — the 't' is for threads!
+
+In Python 3.14, PEP 779 made it officially supported.
+It's still a separate build: plain python keeps the GIL.
+
+No big lock means threads really run in parallel. It works thanks to biased reference counting, per-object locks, and the mimalloc allocator.
+
+Try it on Linux with uv:
+> $ uv python install 3.14t
+> $ uv run -p 3.14t app.py
+
+Check from inside Python:
+> >>> import sys
+> >>> sys._is_gil_enabled()
+> False
+
+Trade-offs: single-threaded code is a bit slower (about 5–10%),
+and C extensions need free-threaded builds — or the GIL switches back on.
+
+Bottom line: the GIL is becoming optional.
+Got CPU-bound threads? Grab a 't' build and measure!
