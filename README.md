@@ -1,12 +1,12 @@
 # Talking Character
 
-Turn a plain-text script into a video of a character (made from a single still image) that flaps its mouth while speech bubbles type out, blinks every few seconds, sways and bobs gently, and plays soft "voice blips".
+Turn a plain-text script into a video of a character (made from a single still image) that speaks each line aloud with a [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) text-to-speech voice, moving its mouth in sync with the speech while the speech bubble types out. It also blinks every few seconds and sways and bobs gently. With `--no-voice` it plays soft "voice blips" instead.
 
 The included example, `gil_script.txt`, renders to `gil_explained.mp4`.
 
 ## Setup
 
-Requirements: Python 3.9+ and [ffmpeg](https://ffmpeg.org/) on your `PATH`.
+Requirements: Python 3.10+ and [ffmpeg](https://ffmpeg.org/) on your `PATH`.
 
 ```bash
 # install ffmpeg (Debian/Ubuntu example)
@@ -17,6 +17,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+On the first voiced render, the Kokoro model files (about 350 MB) are downloaded to `~/.cache/talking-character`. Spoken lines are cached there too, so re-renders and `--preview` runs only synthesize lines that changed.
 
 ## Usage
 
@@ -35,9 +37,13 @@ Useful options (`--help` lists all):
 | `-c, --character` | Character JSON config | `character.json` |
 | `--size` | Video height (16:9): 1080, 720, 480... | 1080 |
 | `--fps` | Frames per second | 30 |
-| `--cps` | Typing speed, characters/sec | 32 |
-| `--pitch` | Voice blip pitch multiplier | 1.0 |
-| `--no-audio` | Skip the voice blips | off |
+| `--voice` | Kokoro voice (`af_heart`, `af_bella`, `am_puck`, `bf_emma`, ...) | `voice.name` in the character JSON |
+| `--speed` | Speech speed multiplier | `voice.speed` in the character JSON |
+| `--no-voice` | No speech: voice blips and random mouth flaps | off |
+| `--kokoro-dir` | Where model files and cached speech go | `~/.cache/talking-character` |
+| `--cps` | Typing speed, characters/sec, for bubbles without speech | 32 |
+| `--pitch` | Voice blip pitch multiplier (with `--no-voice`) | 1.0 |
+| `--no-audio` | Silent video (speech still sets the timing and mouth) | off |
 | `--no-blink` | Keep the eyes open | off |
 | `--workers` | Render processes | CPU count |
 | `--crf` | Video quality (lower is better) | 20 |
@@ -55,14 +61,18 @@ Hi! This line is one bubble.
 
 A blank line starts a new bubble.
 A new line inside a bubble starts a new paragraph.
-> $ lines starting with "> " are code (monospace, dark box)
+> $ lines starting with "> " are code (monospace, dark box, not spoken)
 [pause 1.5]                         hold with no bubble for N seconds
 // comment lines are ignored
 ```
 
+Each bubble's text (minus code lines) is spoken; the bubble types out over the length of the speech and the mouth opens with its loudness. A bubble with only code lines is shown silently.
+
 ## Customizing the character
 
 `character.json` points at the image (`character.png`) and defines its placement, motion, colors, the mouth (cover polygon, closed-mouth line, hinge), and the eyes. Copy it and the PNG to make a new character, then pass it with `-c`.
+
+The optional `voice` block picks the speech: `name` (a Kokoro voice, default `af_heart`), `speed` (default 1.0), and `lang` (espeak language code, default `en-us`).
 
 The optional `eyes` block makes the character blink. All coordinates are in source-image pixels:
 

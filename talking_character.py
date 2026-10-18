@@ -2,9 +2,10 @@
 """
 talking_character.py - turn a plain-text script into a talking-character video.
 
-The character (from a single still image) flaps its mouth while each speech
-bubble types out, blinks every few seconds, drifts/bobs gently, and soft
-"voice blips" play while talking.
+The character (from a single still image) speaks each bubble with a Kokoro
+text-to-speech voice, its mouth following the loudness of the speech while the
+bubble types out; it blinks every few seconds and drifts/bobs gently. With
+--no-voice it plays soft "voice blips" and flaps its mouth instead.
 
 Usage:
     python3 talking_character.py SCRIPT.txt -o out.mp4
@@ -18,16 +19,17 @@ Script format (plain text, UTF-8):
 
     A blank line starts a new bubble.
     A new line inside a bubble starts a new paragraph.
-    > $ lines starting with "> " are code (monospace, dark box)
+    > $ lines starting with "> " are code (monospace, dark box, not spoken)
     [pause 1.5]                          on its own: hold with no bubble for N seconds
     // comment lines are ignored
 
 Character settings (image, mouth and eye shapes, placement) live in a JSON file;
 see character.json next to this script.
 
-Requires: Python 3.9+, Pillow, NumPy, OpenCV (opencv-python-headless), ffmpeg.
+Requires: Python 3.10+, Pillow, NumPy, OpenCV (opencv-python-headless), ffmpeg,
+and kokoro-onnx for the voice (model files are downloaded on first use).
 """
-import argparse, json, math, multiprocessing as mp, os, random, re, subprocess, sys, time, wave
+import argparse, hashlib, json, math, multiprocessing as mp, os, random, re, subprocess, sys, time, urllib.request, wave
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -212,19 +214,40 @@ def setup(args):
     G['META'] = meta
     title_s = 2.6 if meta['title'] else 0.0
     G['TITLE_S'] = title_s
-    bubbles, t = [], title_s
+    vcfg = dict(cfg.get('voice', {}))
+    if args.voice: vcfg['name'] = args.voice
+    if args.speed: vcfg['speed'] = args.speed
+    tts = None if args.no_voice else Speaker(vcfg, args.kokoro_dir)
+    bubbles, clips, t = [], [], title_s
     for it in items:
         if it['kind'] == 'pause':
             t += it['secs']; continue
         lay = layout_bubble(it['lines'])
         n = lay['nchars']
-        rev = n / args.cps
-        hold = args.hold_base + n / args.read_cps
-        bubbles.append(dict(tag=it['tag'], lay=lay, s=t, r=t + rev, e=t + rev + hold))
+        text = ' '.join(x for k, x in it['lines'] if k == 'body')
+        clip = tts.say(text) if tts and text.strip() else None
+        if clip is not None:
+            # type the bubble out over the speech, then hold briefly
+            rev = max(len(clip) / tts.SR, n / (args.cps * 3))
+            hold = args.hold_base
+            clips.append((t + 0.15, clip))
+        else:
+            rev = n / args.cps
+            hold = args.hold_base + n / args.read_cps
+        bubbles.append(dict(tag=it['tag'], lay=lay, s=t, r=t + rev, e=t + rev + hold, cps=n / rev))
         t += rev + hold + 0.25
     G['BUBBLES'] = bubbles
     G['TOTAL'] = t + 1.2
     G['NF'] = int(G['TOTAL'] * args.fps)
+
+    # speech track: every clip mixed onto one timeline; per-frame loudness drives the mouth
+    G['SPEECH'] = None
+    if tts:
+        sr = tts.SR; buf = np.zeros(int(G['TOTAL'] * sr), np.float32)
+        for at, clip in clips:
+            i0 = int(at * sr); buf[i0:i0 + len(clip)] += clip[:len(buf) - i0]
+        G['SPEECH'], G['SR'] = buf, sr
+        G['MOUTH'] = mouth_track(buf, sr, args.fps, G['NF'])
 
     # deterministic mouth sequence (changes every 3 frames, never repeats)
     r = random.Random(3); seq, prev = [], 0
@@ -354,7 +377,7 @@ def draw_bubble(img, b, tt, tip):
     layer = Image.fromarray(out, 'RGBA')
     d = ImageDraw.Draw(layer)
 
-    shown = int((tt - s) * G['CPS'])
+    shown = int((tt - s) * b['cps'])
     rows = lay['rows']
     # code box (appears once its first character is reached)
     y = by0 + pad - int(4 * S); cb = None; before = 0; counted = 0
@@ -437,6 +460,8 @@ def draw_title(img, tt):
     img.alpha_composite(layer)
 
 def mouth_state(fi, tt):
+    if G['SPEECH'] is not None:
+        return G['MOUTH'][fi] if fi < len(G['MOUTH']) else 0
     if any(b['s'] <= tt < b['r'] + 0.08 for b in G['BUBBLES']):
         return G['MSEQ'][fi // 3]
     return 0
@@ -485,6 +510,70 @@ def frame_bytes(fi):
 # ======================================================================
 # Audio
 # ======================================================================
+KOKORO_URL = 'https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/'
+
+class Speaker:
+    """Kokoro TTS; clips are cached on disk by (text, voice, speed, lang)."""
+    SR = 24000
+
+    def __init__(self, vcfg, model_dir):
+        self.name = vcfg.get('name', 'af_heart')
+        self.speed = float(vcfg.get('speed', 1.0))
+        self.lang = vcfg.get('lang', 'en-us')
+        self.dir = os.path.expanduser(model_dir)
+        self.cache = os.path.join(self.dir, 'clips')
+        os.makedirs(self.cache, exist_ok=True)
+        self.k = None
+
+    def model(self):
+        if self.k is None:
+            try:
+                from kokoro_onnx import Kokoro
+            except ImportError:
+                sys.exit('The voice needs kokoro-onnx: pip install kokoro-onnx  (or pass --no-voice)')
+            paths = []
+            for f in ('kokoro-v1.0.onnx', 'voices-v1.0.bin'):
+                p = os.path.join(self.dir, f); paths.append(p)
+                if not os.path.exists(p):
+                    print(f'downloading {KOKORO_URL + f} ...', file=sys.stderr)
+                    urllib.request.urlretrieve(KOKORO_URL + f, p + '.part'); os.replace(p + '.part', p)
+            self.k = Kokoro(*paths)
+            if self.name not in self.k.get_voices():
+                sys.exit(f"Unknown voice {self.name!r}; choose from: {', '.join(self.k.get_voices())}")
+        return self.k
+
+    def say(self, text):
+        key = hashlib.sha1(json.dumps([text, self.name, self.speed, self.lang]).encode()).hexdigest()[:16]
+        p = os.path.join(self.cache, key + '.npy')
+        if os.path.exists(p):
+            return np.load(p)
+        print(f'  speaking: {text[:60]}{"..." if len(text) > 60 else ""}', file=sys.stderr)
+        audio, sr = self.model().create(text, voice=self.name, speed=self.speed, lang=self.lang)
+        assert sr == self.SR
+        audio = audio.astype(np.float32); np.save(p, audio)
+        return audio
+
+def mouth_track(buf, sr, fps, nf):
+    # RMS loudness per frame (taken a touch ahead of the sound, since lips move
+    # first), thresholded into closed/mid/open; dips between syllables close it
+    hop = sr / fps; lead = int(0.02 * sr)
+    rms = np.zeros(nf, np.float32)
+    for i in range(nf):
+        seg = buf[int(i * hop) + lead:int((i + 1) * hop) + lead]
+        if len(seg): rms[i] = np.sqrt((seg ** 2).mean())
+    voiced = rms[rms > 1e-3]
+    lvl = rms / max(np.percentile(voiced, 90) if len(voiced) else 1.0, 1e-6)
+    states = np.where(lvl < 0.15, 0, np.where(lvl < 0.6, 1, 2)).astype(np.int8)
+    # a frame clearly quieter than both neighbours is a syllable break: close a notch
+    dip = (lvl[1:-1] < 0.75 * lvl[:-2]) & (lvl[1:-1] < 0.75 * lvl[2:])
+    states[1:-1][dip] = np.maximum(0, states[1:-1][dip] - 1)
+    return states
+
+def write_speech(path):
+    pcm = (np.clip(G['SPEECH'], -1, 1) * 32767).astype(np.int16)
+    with wave.open(path, 'wb') as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(G['SR']); w.writeframes(pcm.tobytes())
+
 def make_audio(path, pitch=1.0):
     sr = 44100
     n = int(G['TOTAL'] * sr); buf = np.zeros(n, np.float32)
@@ -511,11 +600,15 @@ def main():
     ap.add_argument('-c', '--character', default=os.path.join(HERE, 'character.json'), help='character JSON config')
     ap.add_argument('--size', type=int, default=1080, help='video height: 1080, 720, 480 ... (16:9)')
     ap.add_argument('--fps', type=int, default=30)
-    ap.add_argument('--cps', type=float, default=32, help='typing speed, characters/sec')
+    ap.add_argument('--cps', type=float, default=32, help='typing speed, characters/sec (bubbles without speech)')
     ap.add_argument('--read-cps', type=float, default=38, help='extra hold time after typing = hold-base + chars/read-cps')
     ap.add_argument('--hold-base', type=float, default=0.9)
-    ap.add_argument('--pitch', type=float, default=1.0, help='voice blip pitch multiplier')
-    ap.add_argument('--no-audio', action='store_true')
+    ap.add_argument('--voice', default=None, help="Kokoro voice, e.g. af_heart, am_puck (default: character.json's voice.name)")
+    ap.add_argument('--speed', type=float, default=None, help="speech speed multiplier (default: character.json's voice.speed)")
+    ap.add_argument('--no-voice', action='store_true', help='no speech: voice blips and random mouth flaps instead')
+    ap.add_argument('--kokoro-dir', default='~/.cache/talking-character', help='where Kokoro model files and cached speech go')
+    ap.add_argument('--pitch', type=float, default=1.0, help='voice blip pitch multiplier (with --no-voice)')
+    ap.add_argument('--no-audio', action='store_true', help='silent video (speech still sets timing and mouth)')
     ap.add_argument('--no-blink', action='store_true', help='keep the eyes open (ignore the eyes config)')
     ap.add_argument('--workers', type=int, default=os.cpu_count() or 1)
     ap.add_argument('--crf', type=int, default=20)
@@ -538,7 +631,10 @@ def main():
            '-s', f"{G['W']}x{G['H']}", '-r', str(args.fps), '-i', '-']
     wav = None
     if G['AUDIO']:
-        wav = out + '.blips.wav'; make_audio(wav, args.pitch)
+        if G['SPEECH'] is not None:
+            wav = out + '.speech.wav'; write_speech(wav)
+        else:
+            wav = out + '.blips.wav'; make_audio(wav, args.pitch)
         cmd += ['-i', wav, '-c:a', 'aac', '-b:a', '128k', '-shortest']
     cmd += ['-c:v', 'libx264', '-preset', 'medium', '-crf', str(args.crf), '-pix_fmt', 'yuv420p', '-movflags', '+faststart', out]
     ff = subprocess.Popen(cmd, stdin=subprocess.PIPE)

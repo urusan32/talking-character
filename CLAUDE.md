@@ -1,11 +1,12 @@
 # Notes for development
 
-Single-file tool: `talking_character.py` (script parsing, bubble layout, frame rendering with multiprocessing, audio blips, piping raw frames to ffmpeg). Character sprites are pre-rendered in `setup()` as `G['frames'][eye_state][mouth_state]` (3×3: open/half/closed eyes × closed/mid/open mouth); `eye_state()` follows the seeded blink schedule in `G['BLINKS']`, `mouth_state()` the seeded mouth sequence. Character config lives in `character.json`; example input/output are `gil_script.txt` / `gil_explained.mp4`.
+Single-file tool: `talking_character.py` (script parsing, Kokoro TTS, bubble layout, frame rendering with multiprocessing, audio, piping raw frames to ffmpeg). Character sprites are pre-rendered in `setup()` as `G['frames'][eye_state][mouth_state]` (3×3: open/half/closed eyes × closed/mid/open mouth); `eye_state()` follows the seeded blink schedule in `G['BLINKS']`. With voice (the default), `setup()` synthesizes each bubble via the `Speaker` class (kokoro-onnx), lays bubbles out to fit the speech, mixes `G['SPEECH']`, and `mouth_track()` turns its per-frame loudness into `G['MOUTH']`, which `mouth_state()` reads; with `--no-voice` it uses the seeded random sequence and blips. Character config lives in `character.json`; example input/output are `gil_script.txt` / `gil_explained.mp4`.
 
 ## Local environment
 
 - Python via pyenv virtualenv `talking-character` (Python 3.13.15). `.python-version` in the repo root selects it automatically (it is gitignored).
 - Install deps: `pip install -r requirements.txt`
+- Kokoro model files and cached speech clips (`clips/*.npy`, keyed by text+voice+speed) live in `~/.cache/talking-character`. Delete `clips/` to force re-synthesis. First synthesis of the example script takes ~45s on CPU; cached runs are fast.
 - ffmpeg is installed system-wide (`/usr/bin/ffmpeg`). `--preview` stills don't need it.
 - Fonts are searched in `/usr/share/fonts`, `/usr/local/share/fonts`, `~/.fonts`, `~/.local/share/fonts`, and the repo dir; falls back to Pillow's default.
 
@@ -20,6 +21,6 @@ Use `--size 480` or `--preview` while iterating; 1080p full renders are slow. Wi
 
 ## Conventions
 
-- Keep dependencies minimal (numpy, opencv-python-headless, Pillow); `requirements.txt` is unpinned.
+- Keep dependencies minimal (numpy, opencv-python-headless, Pillow, kokoro-onnx — the ONNX build, not the torch `kokoro` package, which doesn't support Python 3.13); `requirements.txt` is unpinned.
 - Large binaries (`gil_explained.mp4`, `character.png`) are committed; avoid committing more renders.
 - `.gitignore` excludes `preview*.png`; name scratch stills accordingly.

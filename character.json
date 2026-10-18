@@ -7,6 +7,7 @@
   "tail_target": [295, 665],
   "bubble_right": 930,
   "motion": {"sway": 26, "bob": 9, "tilt_deg": 1.6},
+  "voice": {"name": "af_heart", "speed": 1.0, "lang": "en-us"},
   "mouth": {
     "skin_color": [255, 219, 207],
     "line_color": [118, 20, 22],
