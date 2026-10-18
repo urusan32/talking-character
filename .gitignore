@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Local environment
+.python-version
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Preview stills and scratch output
+preview*.png
+*.tmp
