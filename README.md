@@ -70,6 +70,19 @@ Each bubble's text (minus code lines) is spoken; the bubble types out over the l
 
 ## Customizing the character
 
+### Making a new character automatically
+
+```bash
+python3 make_character.py my_character.png          # writes my_character.json
+python3 talking_character.py SCRIPT.txt -c my_character.json
+```
+
+`make_character.py` finds the eyes, the open mouth and the skin in the image, and derives the blink and mouth shapes, line colors and widths, placement, bubble tail target and UI colors from them. It then lists the Kokoro voices and asks which one the character should use: type a voice name (e.g. `bella` or `bm_george`) to hear a sample, Enter to keep it, then pick a speed the same way. Pass `--voice NAME --speed N` to skip the prompts.
+
+It works best on a flat-colored cartoon portrait with a plain background, both eyes open and the mouth open. It writes `preview_<name>.png` (detected shapes | half blink | eyes and mouth closed) so you can check the result. If it picks the wrong features, give rough points in image pixels: `--eyes X,Y X,Y --mouth X,Y`. You can also fine-tune the JSON by hand as described below.
+
+### The character JSON
+
 `character.json` points at the image (`character.png`) and defines its placement, motion, colors, the mouth (cover polygon, closed-mouth line, hinge), and the eyes. Copy it and the PNG to make a new character, then pass it with `-c`.
 
 The optional `voice` block picks the speech: `name` (a Kokoro voice, default `af_heart`), `speed` (default 1.0), and `lang` (espeak language code, default `en-us`).
