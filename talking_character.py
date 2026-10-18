@@ -3,7 +3,8 @@
 talking_character.py - turn a plain-text script into a talking-character video.
 
 The character (from a single still image) flaps its mouth while each speech
-bubble types out, drifts/bobs gently, and soft "voice blips" play while talking.
+bubble types out, blinks every few seconds, drifts/bobs gently, and soft
+"voice blips" play while talking.
 
 Usage:
     python3 talking_character.py SCRIPT.txt -o out.mp4
@@ -21,7 +22,7 @@ Script format (plain text, UTF-8):
     [pause 1.5]                          on its own: hold with no bubble for N seconds
     // comment lines are ignored
 
-Character settings (image, mouth shape, placement) live in a JSON file;
+Character settings (image, mouth and eye shapes, placement) live in a JSON file;
 see character.json next to this script.
 
 Requires: Python 3.9+, Pillow, NumPy, OpenCV (opencv-python-headless), ffmpeg.
@@ -29,7 +30,7 @@ Requires: Python 3.9+, Pillow, NumPy, OpenCV (opencv-python-headless), ffmpeg.
 import argparse, json, math, multiprocessing as mp, os, random, re, subprocess, sys, time, wave
 import numpy as np
 import cv2
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -111,26 +112,65 @@ def setup(args):
     bg = tuple(cfg.get('background') or np.median(
         np.concatenate([a[:8, :8].reshape(-1, 3), a[:8, -8:].reshape(-1, 3), a[-8:, :8].reshape(-1, 3)]), 0).astype(int).tolist())
     G['BG'] = bg
+    def cover(base, poly, skin):
+        # fill poly with skin, feathering the edge by a pixel so no seam shows
+        msk = Image.new('L', base.size, 0); ImageDraw.Draw(msk).polygon(poly, fill=255)
+        return Image.composite(Image.new('RGB', base.size, skin), base, msk.filter(ImageFilter.GaussianBlur(1.2)))
+
+    def smooth(pts, n=8):
+        # Catmull-Rom spline through pts, so few control points give a clean curve
+        p = [pts[0]] + list(pts) + [pts[-1]]; out = []
+        for i in range(1, len(p) - 2):
+            (x0, y0), (x1, y1), (x2, y2), (x3, y3) = p[i - 1:i + 3]
+            for k in range(n):
+                t = k / n; t2, t3 = t * t, t * t * t
+                out.append(tuple(0.5 * (2 * b + (c - a) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (3 * b - a - 3 * c + d) * t3)
+                                 for a, b, c, d in ((x0, x1, x2, x3), (y0, y1, y2, y3))))
+        return out + [tuple(pts[-1])]
+
+    def squash(base, poly, skin, ratio, anchor_y=None, bottom=False):
+        # cover poly with skin, then paste the original region squashed vertically
+        # toward anchor_y (top hinge) or, with bottom=True, toward the region's bottom
+        out = cover(base, poly, skin)
+        xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
+        box = (min(xs), min(ys) if anchor_y is None else anchor_y, max(xs) + 1, max(ys) + 1)
+        reg = base.crop(box)
+        msk = Image.new('L', base.size, 0); ImageDraw.Draw(msk).polygon(poly, fill=255)
+        nh = max(1, int(reg.height * ratio))
+        at = (box[0], box[3] - nh) if bottom else box[:2]
+        out.paste(reg.resize((reg.width, nh), Image.LANCZOS), at,
+                  msk.crop(box).resize((reg.width, nh), Image.LANCZOS))
+        return out
+
+    # eyes: open / half / closed versions of the base image
+    eyes = None if args.no_blink else cfg.get('eyes')
+    if eyes:
+        eskin = tuple(eyes.get('skin_color') or (cfg.get('mouth') or {}).get('skin_color', [255, 219, 207]))
+        ecol = tuple(eyes.get('line_color', [10, 12, 16]))
+        half, closed = src, src.copy()
+        for e in eyes['shapes']:
+            poly = [tuple(p) for p in e['cover_polygon']]
+            half = squash(half, poly, eskin, eyes.get('half_ratio', 0.5), bottom=True)
+            closed = cover(closed, poly, eskin)
+            ImageDraw.Draw(closed).line(smooth(e['closed_line']), fill=ecol,
+                                        width=eyes.get('line_width', 7), joint='curve')
+        eye_bases = [src, half, closed]
+    else:
+        eye_bases = [src]
+
+    # mouth: closed / mid / open, applied on top of each eye state
     mouth = cfg.get('mouth')
-    if mouth:
+    def mouth_variants(base):
+        if not mouth:
+            return [base, base, base]  # no mouth config: just bob
         poly = [tuple(p) for p in mouth['cover_polygon']]
         lip = [tuple(p) for p in mouth['closed_line']]
         skin = tuple(mouth['skin_color']); line_col = tuple(mouth.get('line_color', [118, 20, 22]))
-        def covered():
-            b = src.copy(); ImageDraw.Draw(b).polygon(poly, fill=skin); return b
-        closed = covered(); ImageDraw.Draw(closed).line(lip, fill=line_col, width=mouth.get('line_width', 4), joint='curve')
-        mid = covered()
-        xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
-        top = mouth.get('hinge_y', min(ys) - 6)
-        box = (min(xs), top, max(xs) + 1, max(ys) + 1)
-        reg = src.crop(box)
-        msk = Image.new('L', src.size, 0); ImageDraw.Draw(msk).polygon(poly, fill=255)
-        nh = max(1, int(reg.height * mouth.get('mid_ratio', 0.55)))
-        mid.paste(reg.resize((reg.width, nh), Image.LANCZOS), box[:2],
-                  msk.crop(box).resize((reg.width, nh), Image.LANCZOS))
-        variants = [closed, mid, src]
-    else:
-        variants = [src, src, src]  # no mouth config: just bob
+        closed = base.copy(); ImageDraw.Draw(closed).polygon(poly, fill=skin)
+        ImageDraw.Draw(closed).line(lip, fill=line_col, width=mouth.get('line_width', 4), joint='curve')
+        top = mouth.get('hinge_y', min(p[1] for p in poly) - 6)
+        mid = squash(base, poly, skin, mouth.get('mid_ratio', 0.55), anchor_y=top)
+        return [closed, mid, base]
 
     def keyed(img):
         f = np.asarray(img).astype(np.float32)
@@ -141,7 +181,9 @@ def setup(args):
     ch_h = int(H * cfg.get('height_frac', 1.06))
     sc = ch_h / srch
     ch_w = int(srcw * sc)
-    G['mouths'] = [cv2.resize(keyed(v), (ch_w, ch_h), interpolation=cv2.INTER_AREA) for v in variants]
+    # G['frames'][eye_state][mouth_state]
+    G['frames'] = [[cv2.resize(keyed(v), (ch_w, ch_h), interpolation=cv2.INTER_AREA) for v in mouth_variants(eb)]
+                   for eb in eye_bases]
     G['CH'] = (ch_w, ch_h)
     G['CX0'] = W - ch_w + int(cfg.get('right_overhang', 40) * S)
     G['CY0'] = int(cfg.get('top_offset', -30) * S)
@@ -189,6 +231,18 @@ def setup(args):
     for _ in range(G['NF'] // 3 + 2):
         prev = r.choice([c for c in (0, 1, 2, 1, 2) if c != prev]); seq.append(prev)
     G['MSEQ'] = seq
+
+    # deterministic blink schedule: (start, duration) every few seconds, sometimes a double blink
+    blinks = []
+    if eyes:
+        lo, hi = eyes.get('interval', [2.5, 5.5]); dur = eyes.get('duration', 0.16)
+        r = random.Random(5); t = r.uniform(0.8, lo)
+        while t < G['TOTAL']:
+            blinks.append((t, dur))
+            if r.random() < eyes.get('double_chance', 0.15):
+                blinks.append((t + dur + 0.12, dur))
+            t += r.uniform(lo, hi)
+    G['BLINKS'] = blinks
 
     # background: pre-render dot grid once
     step = int(60 * S)
@@ -387,6 +441,18 @@ def mouth_state(fi, tt):
         return G['MSEQ'][fi // 3]
     return 0
 
+def eye_state(tt):
+    # 0 open, 1 half, 2 closed: half -> closed -> half over each blink
+    if len(G['frames']) == 1:
+        return 0
+    for s, d in G['BLINKS']:
+        if s <= tt < s + d:
+            x = (tt - s) / d
+            return 2 if 0.25 <= x < 0.7 else 1
+        if s > tt:
+            break
+    return 0
+
 def render_frame(fi):
     tt = fi / G['FPS']
     img = background(tt)
@@ -394,7 +460,7 @@ def render_frame(fi):
     dx = sway * math.sin(tt * 0.45) + sway * 0.3 * math.sin(tt * 1.1)
     dy = bob * math.sin(tt * 1.6) + bob * 0.55 * math.sin(tt * 0.7)
     ang = tilt * math.sin(tt * 0.6 + 0.5)
-    ch = G['mouths'][mouth_state(fi, tt)]
+    ch = G['frames'][eye_state(tt)][mouth_state(fi, tt)]
     cw, chh = G['CH']
     M = cv2.getRotationMatrix2D(G['PIVOT'], ang, 1.0)
     rot = cv2.warpAffine(ch, M, (cw, chh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
@@ -450,6 +516,7 @@ def main():
     ap.add_argument('--hold-base', type=float, default=0.9)
     ap.add_argument('--pitch', type=float, default=1.0, help='voice blip pitch multiplier')
     ap.add_argument('--no-audio', action='store_true')
+    ap.add_argument('--no-blink', action='store_true', help='keep the eyes open (ignore the eyes config)')
     ap.add_argument('--workers', type=int, default=os.cpu_count() or 1)
     ap.add_argument('--crf', type=int, default=20)
     ap.add_argument('--preview', type=float, nargs='+', metavar='SEC', help='write PNG stills at these times (seconds) instead of a video')
