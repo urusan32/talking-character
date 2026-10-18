@@ -109,16 +109,8 @@ def setup(args):
 
     # ---------- character image + mouth variants ----------
     src = Image.open(os.path.join(cdir, cfg['image'])).convert('RGB')
-    srcw, srch = src.size
-    a = np.asarray(src)
-    bg = tuple(cfg.get('background') or np.median(
-        np.concatenate([a[:8, :8].reshape(-1, 3), a[:8, -8:].reshape(-1, 3), a[-8:, :8].reshape(-1, 3)]), 0).astype(int).tolist())
-    G['BG'] = bg
-    def cover(base, poly, skin):
-        # fill poly with skin, feathering the edge by a pixel so no seam shows
-        msk = Image.new('L', base.size, 0); ImageDraw.Draw(msk).polygon(poly, fill=255)
-        return Image.composite(Image.new('RGB', base.size, skin), base, msk.filter(ImageFilter.GaussianBlur(1.2)))
-
+    crop = cfg.get('crop') or [0, 0, *src.size]   # source-pixel box kept in the video; all other coords stay in full-image pixels
+    srcw, srch = crop[2] - crop[0], crop[3] - crop[1]
     def smooth(pts, n=8):
         # Catmull-Rom spline through pts, so few control points give a clean curve
         p = [pts[0]] + list(pts) + [pts[-1]]; out = []
@@ -129,6 +121,20 @@ def setup(args):
                 out.append(tuple(0.5 * (2 * b + (c - a) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (3 * b - a - 3 * c + d) * t3)
                                  for a, b, c, d in ((x0, x1, x2, x3), (y0, y1, y2, y3))))
         return out + [tuple(pts[-1])]
+
+    for fx in cfg.get('fixups', []):   # repaint part of the source: fill a polygon with the background, optionally outline an edge
+        fd = ImageDraw.Draw(src)
+        fd.polygon([tuple(q) for q in fx['fill']], fill=tuple(cfg['background']))
+        if fx.get('line'):
+            fd.line(smooth(fx['line']), fill=tuple(fx.get('color', [17, 18, 20])), width=fx.get('width', 9), joint='curve')
+    a = np.asarray(src)
+    bg = tuple(cfg.get('background') or np.median(
+        np.concatenate([a[:8, :8].reshape(-1, 3), a[:8, -8:].reshape(-1, 3), a[-8:, :8].reshape(-1, 3)]), 0).astype(int).tolist())
+    G['BG'] = bg
+    def cover(base, poly, skin):
+        # fill poly with skin, feathering the edge by a pixel so no seam shows
+        msk = Image.new('L', base.size, 0); ImageDraw.Draw(msk).polygon(poly, fill=255)
+        return Image.composite(Image.new('RGB', base.size, skin), base, msk.filter(ImageFilter.GaussianBlur(1.2)))
 
     def squash(base, poly, skin, ratio, anchor_y=None, bottom=False):
         # cover poly with skin, then paste the original region squashed vertically
@@ -175,7 +181,7 @@ def setup(args):
         return [closed, mid, base]
 
     def keyed(img):
-        f = np.asarray(img).astype(np.float32)
+        f = np.asarray(img.crop(tuple(crop))).astype(np.float32)
         d = np.sqrt(((f - np.array(bg, np.float32)) ** 2).sum(-1))
         alpha = np.clip((d - 14) / 26, 0, 1) * 255
         return np.dstack([f, alpha]).astype(np.uint8)
@@ -187,14 +193,25 @@ def setup(args):
     G['frames'] = [[cv2.resize(keyed(v), (ch_w, ch_h), interpolation=cv2.INTER_AREA) for v in mouth_variants(eb)]
                    for eb in eye_bases]
     G['CH'] = (ch_w, ch_h)
+    G['STREAK'] = None
+    st = (cfg.get('cry') or {}).get('streaks')
+    if st:   # mask of the pale tear streaks, so setup_cry's flow can be drawn only on them
+        f = a[crop[1]:crop[3], crop[0]:crop[2]].astype(np.float32)
+        m = np.clip(1 - (np.sqrt(((f - np.array(st['color'], np.float32)) ** 2).sum(-1)) - st.get('tol', 28)) / 14, 0, 1)
+        m = cv2.resize(m, (ch_w, ch_h), interpolation=cv2.INTER_AREA)
+        ys, xs = np.where(m > 0.02)
+        box = (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
+        G['STREAK'] = (m[box[1]:box[3], box[0]:box[2], None], box, st)
     G['CX0'] = W - ch_w + int(cfg.get('right_overhang', 40) * S)
     G['CY0'] = int(cfg.get('top_offset', -30) * S)
-    px, py = cfg.get('pivot', [srcw * 0.55, srch * 0.88])
-    G['PIVOT'] = (px * sc, py * sc)
-    tx, ty = cfg.get('tail_target', [srcw * 0.3, srch * 0.68])
-    G['TAILT'] = (tx * sc, ty * sc)
+    px, py = cfg.get('pivot', [crop[0] + srcw * 0.55, crop[1] + srch * 0.88])
+    G['PIVOT'] = ((px - crop[0]) * sc, (py - crop[1]) * sc)
+    tx, ty = cfg.get('tail_target', [crop[0] + srcw * 0.3, crop[1] + srch * 0.68])
+    G['TAILT'] = ((tx - crop[0]) * sc, (ty - crop[1]) * sc)
+    G['SRC2CH'] = (crop[0], crop[1], sc)
     mv = cfg.get('motion', {})
     G['MOTION'] = (mv.get('sway', 26) * S, mv.get('bob', 9) * S, mv.get('tilt_deg', 1.6))
+    G['CRYCFG'] = cfg.get('cry')
 
     # ---------- fonts ----------
     bold = find_font(cfg.get('fonts', {}).get('body', []) + ['DejaVuSans-Bold.ttf', 'NotoSans-Bold.ttf', 'LiberationSans-Bold.ttf', 'FreeSansBold.ttf'])
@@ -278,6 +295,130 @@ def setup(args):
     br = random.Random(7)
     G['BLOBS'] = [(br.uniform(0, W), br.uniform(0, H), br.uniform(80, 230) * S, br.uniform(0, 6.28), br.uniform(0.05, 0.12)) for _ in range(9)]
     G['AUDIO'] = not args.no_audio
+    if G['CRYCFG']:
+        setup_cry(G['CRYCFG'])
+
+# ======================================================================
+# Crying effects (character.json "cry"): tear spray, sobbing, rising water
+# ======================================================================
+SOB_BEATS = ((0.15, 1.0), (0.42, 0.7))   # (seconds into the sob period, strength) of each jolt
+
+def setup_cry(c):
+    S = G['S']
+    sob = c.get('sob')
+    G['SOB'] = (sob['period'], sob.get('amp', 14) * S, sob.get('tilt_deg', 1.2)) if sob else None
+    G['WATER'] = c.get('water')
+    G['RAIN'] = c.get('rain', 0)
+    x0, y0, sc = G['SRC2CH']
+    ev = []   # one row per tear: start time and position, velocity, size
+    r = random.Random(21)
+    for e in c.get('emitters', []):
+        t = -2.5
+        while t < G['TOTAL']:
+            t += r.expovariate(e['rate'])
+            dx, dy, _ = char_motion(t)
+            sx, sy = e.get('spread', [0, 0])
+            ev.append((t, G['CX0'] + dx + (e['pos'][0] - x0) * sc, G['CY0'] + dy + (e['pos'][1] - y0) * sc,
+                       (e['vel'][0] + r.gauss(0, sx)) * S, (e['vel'][1] + r.gauss(0, sy)) * S,
+                       e.get('size', 8) * S * r.uniform(0.7, 1.25)))
+    G['TEARS'] = np.array(ev, np.float32).reshape(-1, 6)
+    G['RAINDROPS'] = [(r.uniform(0, G['W']), r.uniform(0, G['H']), r.uniform(220, 420) * S, r.uniform(4, 8) * S) for _ in range(G['RAIN'])]
+
+def sob_pulse(tt):
+    # jolt strength at time tt, plus a broader envelope for the trembling in between
+    if not G.get('SOB'): return 0.0, 0.0
+    k = tt % G['SOB'][0]
+    jolt = sum(a * math.exp(-((k - c) / 0.06) ** 2) for c, a in SOB_BEATS)
+    return jolt, math.exp(-((k - 0.3) / 0.35) ** 2)
+
+def char_motion(tt):
+    # character offset (dx, dy) in pixels and rotation in degrees
+    sway, bob, tilt = G['MOTION']
+    dx = sway * math.sin(tt * 0.45) + sway * 0.3 * math.sin(tt * 1.1)
+    dy = bob * math.sin(tt * 1.6) + bob * 0.55 * math.sin(tt * 0.7)
+    ang = tilt * math.sin(tt * 0.6 + 0.5)
+    if G.get('SOB'):
+        jolt, trem = sob_pulse(tt)
+        dy += G['SOB'][1] * jolt
+        ang -= G['SOB'][2] * jolt
+        dx += 2.5 * G['S'] * trem * math.sin(tt * 41)
+    return dx, dy, ang
+
+def flow_streaks(ch, tt):
+    # bands of light and shade sliding down the tear streaks
+    m, (x0, y0, x1, y1), st = G['STREAK']
+    S = G['S']
+    ys, xs = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+    ph = ys / (st.get('wavelength', 46) * S) * 2 * np.pi - tt * st.get('speed', 7) + 0.9 * np.sin(xs / (30 * S) + tt)
+    v = (0.5 + 0.5 * np.sin(ph))[..., None]
+    lit = np.array(st.get('light', [238, 253, 250]), np.float32); dark = np.array(st.get('dark', [150, 214, 214]), np.float32)
+    col = dark * (1 - v) + lit * v
+    out = ch.copy(); reg = out[y0:y1, x0:x1]
+    reg[..., :3] = (reg[..., :3] * (1 - m * 0.6) + col * m * 0.6).astype(np.uint8)
+    return out
+
+def water_level(tt):
+    # surface height in pixels above the bottom edge: rises over the whole video
+    w = G['WATER']
+    return G['H'] * (w['start'] + (w['end'] - w['start']) * min(1, tt / G['TOTAL']))
+
+def water_surface(tt):
+    xs = np.arange(G['W'], dtype=np.float32); S = G['S']
+    return G['H'] - water_level(tt) + S * (7 * np.sin(xs / (90 * S) + tt * 1.7) + 4 * np.sin(xs / (37 * S) - tt * 2.6))
+
+def draw_crying(img, tt):
+    """Tear drops flying and falling, then the rising water over the character."""
+    arr = np.array(img)
+    W, H, S = G['W'], G['H'], G['S']
+    surf = water_surface(tt) if G['WATER'] else np.full(W, H + 100, np.float32)
+    g = 1700 * S
+    T = G['TEARS']
+    dt = tt - T[:, 0]
+    live = (dt >= 0) & (dt < 3.0)
+    for t0, x0, y0, vx, vy, r in T[live]:
+        d = tt - t0
+        x = x0 + vx * d; y = y0 + vy * d + 0.5 * g * d * d
+        if not (0 <= x < W) or y > H or y > surf[int(x)] - r:
+            continue
+        ang = math.degrees(math.atan2(vy + g * d, vx))
+        c = (int(x), int(y)); ax = (max(2, int(r * 1.5)), max(2, int(r)))
+        cv2.ellipse(arr, c, (ax[0] + 2, ax[1] + 2), ang, 0, 360, (36, 160, 170, 255), -1, cv2.LINE_AA)
+        cv2.ellipse(arr, c, ax, ang, 0, 360, (190, 238, 236, 255), -1, cv2.LINE_AA)
+        cv2.circle(arr, (int(x - r * 0.3), int(y - r * 0.3)), max(1, int(r * 0.28)), (255, 255, 255, 255), -1, cv2.LINE_AA)
+    if G['WATER']:
+        rows = np.arange(H, dtype=np.float32)[:, None]
+        depth = np.clip((rows - surf[None, :]) / (60 * S), 0, 1)            # 0 at the surface, 1 when deep
+        a = (rows >= surf[None, :]).astype(np.float32)
+        near = np.clip(1 - np.abs(rows - surf[None, :]) / (3.5 * S), 0, 1)  # bright line along the surface
+        col = np.array(G['WATER']['color'], np.float32); deep = col * 0.78
+        tint = col[None, None, :] * (1 - depth[..., None]) + deep[None, None, :] * depth[..., None]
+        al = (a * G['WATER'].get('alpha', 0.62))[..., None]
+        out = arr[..., :3].astype(np.float32) * (1 - al) + tint * al
+        out = out * (1 - near[..., None] * 0.8) + np.array([205, 245, 245], np.float32) * near[..., None] * 0.8
+        arr[..., :3] = out.astype(np.uint8)
+    return Image.fromarray(arr, 'RGBA')
+
+def make_sfx(sr):
+    """Quiet water plinks (more as the water rises) and a sniffle on every sob."""
+    buf = np.zeros(int(G['TOTAL'] * sr), np.float32); r = random.Random(33)
+    t = np.arange(int(0.16 * sr)) / sr
+    k = 0.4
+    while k < G['TOTAL']:
+        f = r.uniform(700, 1500)
+        env = np.exp(-t * 38) * np.minimum(1, t * 1500)
+        plink = np.sin(2 * np.pi * (f * t + 90 * (1 - np.exp(-t * 30)))) * env * r.uniform(0.03, 0.06)
+        i0 = int(k * sr); buf[i0:i0 + len(plink)] += plink[:len(buf) - i0]
+        k += r.expovariate(2.0 + 5.0 * k / G['TOTAL'])
+    if G.get('SOB'):
+        n = int(0.22 * sr); u = np.arange(n) / sr
+        for s0 in np.arange(0, G['TOTAL'], G['SOB'][0]):
+            for c, a in SOB_BEATS:
+                noise = np.random.RandomState(int(s0 * 10 + c * 100)).randn(n).astype(np.float32)
+                lp = np.convolve(noise, np.ones(6) / 6, 'same'); sn = (lp - np.convolve(lp, np.ones(60) / 60, 'same'))
+                sn *= np.sin(np.pi * np.clip(u / 0.22, 0, 1)) ** 2 * 0.22 * a
+                i0 = int((s0 + c + 0.05) * sr)
+                if i0 + n <= len(buf): buf[i0:i0 + n] += sn
+    return buf
 
 # ======================================================================
 # Bubble layout
@@ -334,6 +475,9 @@ def background(tt):
     for x, y, r, ph, sp in G['BLOBS']:
         cx = x + 40 * S * math.sin(tt * sp + ph); cy = y + 30 * S * math.cos(tt * sp * 1.3 + ph)
         d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(255, 255, 255, 34))
+    for x, y, v, r in G.get('RAINDROPS', []):
+        cy = (y + v * tt) % (H + 4 * r) - 2 * r
+        d.ellipse((x - r * 0.6, cy - r * 1.4, x + r * 0.6, cy + r * 1.4), fill=(255, 255, 255, 46))
     img.alpha_composite(layer)
     step = G['STEP']; off = (tt * 12 * G['S']) % step
     ox, oy = int(step - off), int(step - off * 0.5)
@@ -481,11 +625,10 @@ def eye_state(tt):
 def render_frame(fi):
     tt = fi / G['FPS']
     img = background(tt)
-    sway, bob, tilt = G['MOTION']
-    dx = sway * math.sin(tt * 0.45) + sway * 0.3 * math.sin(tt * 1.1)
-    dy = bob * math.sin(tt * 1.6) + bob * 0.55 * math.sin(tt * 0.7)
-    ang = tilt * math.sin(tt * 0.6 + 0.5)
+    dx, dy, ang = char_motion(tt)
     ch = G['frames'][eye_state(tt)][mouth_state(fi, tt)]
+    if G['STREAK']:
+        ch = flow_streaks(ch, tt)
     cw, chh = G['CH']
     M = cv2.getRotationMatrix2D(G['PIVOT'], ang, 1.0)
     rot = cv2.warpAffine(ch, M, (cw, chh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
@@ -498,6 +641,8 @@ def render_frame(fi):
     img.alpha_composite(cimg, (ox + sx0, oy + sy0), (sx0, sy0, sx1, sy1))
     tx, ty = G['TAILT']
     tip = (int(ox + tx), int(oy + ty))
+    if G['CRYCFG']:
+        img = draw_crying(img, tt)
     draw_title(img, tt)
     draw_tag(img, tt)
     for b in G['BUBBLES']:
@@ -570,7 +715,8 @@ def mouth_track(buf, sr, fps, nf):
     return states
 
 def write_speech(path):
-    pcm = (np.clip(G['SPEECH'], -1, 1) * 32767).astype(np.int16)
+    mix = G['SPEECH'] + (make_sfx(G['SR']) if G['CRYCFG'] else 0)
+    pcm = (np.clip(mix, -1, 1) * 32767).astype(np.int16)
     with wave.open(path, 'wb') as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(G['SR']); w.writeframes(pcm.tobytes())
 
@@ -588,6 +734,7 @@ def make_audio(path, pitch=1.0):
             i0 = int(k * sr); m = max(0, min(L, n - i0))
             buf[i0:i0 + m] += blip[:m]
             k += 1 / 13
+    if G['CRYCFG']: buf += make_sfx(sr)[:n]
     pcm = (np.clip(buf, -1, 1) * 32767).astype(np.int16)
     with wave.open(path, 'wb') as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(pcm.tobytes())
